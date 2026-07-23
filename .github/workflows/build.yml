@@ -1,0 +1,74 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: git-compare-macos.zip
+            onefile_flag: ""
+            icon: icon.icns
+            add_data_sep: ":"
+          - os: windows-latest
+            artifact: git-compare.exe
+            onefile_flag: "--onefile"
+            icon: icon.ico
+            add_data_sep: ";"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build
+        run: >-
+          pyinstaller ${{ matrix.onefile_flag }} --windowed --name git-compare
+          --icon "${{ matrix.icon }}"
+          --add-data "icon.png${{ matrix.add_data_sep }}."
+          --add-data "darklight.png${{ matrix.add_data_sep }}."
+          git-compare.py
+
+      # macOS --windowed always builds a .app bundle (onedir under the hood);
+      # --onefile there is deprecated (PyInstaller warns) and produces a bare
+      # executable with no Info.plist, so the Dock icon reverts once quit.
+      - name: Zip macOS app bundle
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/git-compare.app" "dist/git-compare-macos.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-compare-${{ matrix.os }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/git-compare-macos-latest/git-compare-macos.zip
+            artifacts/git-compare-windows-latest/git-compare.exe
