@@ -38,6 +38,8 @@ choose one.
 This is the main window — a table of every file that differs from the
 selected branch:
 
+<img src="screens/compare-table.png" width="600" alt="Comparison table window">
+
 | Column | Meaning |
 |---|---|
 | checkbox | included when you click "Run Checked" |
@@ -63,6 +65,8 @@ can't be diffed — their checkbox is disabled and the row is greyed out.
 
 Opens automatically when no branch is given, or any time you want to switch
 comparison branches. It lists every local branch with:
+
+<img src="screens/branches.png" width="600" alt="Branch picker window">
 
 | Column | Meaning |
 |---|---|
