@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,13 @@ STATUS_NAMES = {
 
 COL_CHECK, COL_FILE, COL_STATUS, COL_ADD, COL_DEL, COL_RESULT = range(6)
 HEADERS = ["", "File", "Status", "+", "-", "Result"]
+
+# Comparison modes:
+#   MODE_BRANCH  - working tree vs a branch (branch_combo's current text)
+#   MODE_REFS    - two fixed refs/commits, e.g. fork-point diff or HEAD vs a stash
+#   MODE_STAGED  - the index vs a ref (compare_ref, default HEAD); also covers
+#                  "staged vs stash@{n}" since that's just `git diff --staged <ref>`
+MODE_BRANCH, MODE_REFS, MODE_STAGED = 'branch', 'refs', 'staged'
 
 TOOLBAR_BTN_HEIGHT = 26
 DEFAULT_FILTER_EXTENSIONS = [".java", ".xml", ".png", ".gradle"]
@@ -133,6 +141,14 @@ def run_git(repo, args):
 
 def format_git_cmd(repo, args):
     return "git -C '" + str(repo) + "' " + " ".join(args)
+
+
+def format_git_cmd_shell(repo, args):
+    """Shell-quoted `git -C <repo> <args...>`, safe to paste into a terminal
+    (unlike format_git_cmd, which doesn't quote args and is only used for
+    display text where nothing gets pasted/executed)."""
+    parts = ['git', '-C', shlex.quote(str(repo))] + [shlex.quote(str(a)) for a in args]
+    return ' '.join(parts)
 
 
 def list_branches(repo):
@@ -308,10 +324,68 @@ def diff_rows_refs(repo, base, target):
                        "Deleted (present at fork point, removed in branch)")
 
 
+def diff_rows_staged(repo, ref='HEAD'):
+    """Diff the index (staged content) against `ref` — `git diff --staged <ref>`.
+
+    With ref='HEAD' this is plain `git diff --staged`. Passing a stash ref
+    instead compares what's staged right now against that stash entry.
+    """
+    return _diff_rows(repo, ['--staged', ref],
+                       f"Added (staged, not present in {ref})",
+                       f"Deleted (present in {ref}, removed from index)")
+
+
+def staged_summary(repo):
+    """(file_count, lines_added, lines_deleted) for the currently staged diff."""
+    raw = run_git(repo, ['diff', '--staged', '--numstat', '-z'])
+    tokens = raw.split('\0')
+    i = 0
+    files = added = deleted = 0
+    while i < len(tokens) and tokens[i] != '':
+        a, d, rest = tokens[i].split('\t', 2)
+        i += 1 if rest else 3
+        files += 1
+        if a.isdigit():
+            added += int(a)
+        if d.isdigit():
+            deleted += int(d)
+    return files, added, deleted
+
+
+def list_stashes(repo):
+    """[(ref, message, date_str), ...] for every entry in the stash list."""
+    try:
+        out = run_git(repo, ['stash', 'list', '--format=%gd\x1f%gs\x1f%cI'])
+    except RuntimeError:
+        return []
+    stashes = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split('\x1f')
+        if len(parts) != 3:
+            continue
+        ref, message, date_iso = parts
+        stashes.append((ref.strip(), message.strip(), _format_iso_date(date_iso.strip())))
+    return stashes
+
+
 def extract_branch_file(repo, branch, path, cache_dir):
     dest = cache_dir / branch.replace('/', '_') / path
     dest.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(['git', '-C', str(repo), 'show', f'{branch}:{path}'],
+                             capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors='replace').strip())
+    dest.write_bytes(result.stdout)
+    return dest
+
+
+def extract_index_file(repo, path, cache_dir):
+    """Extract the staged (index, stage 0) content of `path` via `git show :<path>`."""
+    dest = cache_dir / '_index' / path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(['git', '-C', str(repo), 'show', f':{path}'],
                              capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode(errors='replace').strip())
@@ -374,6 +448,8 @@ class BranchPickerDialog(QDialog):
     branchSelected = pyqtSignal(str)
     branchesChanged = pyqtSignal()
     forkDiffRequested = pyqtSignal(str)
+    stagedSelected = pyqtSignal()
+    stashDiffRequested = pyqtSignal(str, str)
 
     def __init__(self, repo, branches, parent=None):
         super().__init__(parent)
@@ -394,6 +470,8 @@ class BranchPickerDialog(QDialog):
         self.table.cellClicked.connect(self._on_cell_clicked)
         layout.addWidget(self.table)
 
+        self.pinned_rows = {}
+        self._stashes = []
         self._populate(branches)
 
     def _populate(self, branches):
@@ -401,8 +479,33 @@ class BranchPickerDialog(QDialog):
         base = current or 'HEAD'
         remote_map = remote_branch_map(self.repo)
 
-        self.table.setRowCount(len(branches))
-        for r, branch in enumerate(branches):
+        self.pinned_rows = {}
+        pinned = []
+
+        staged_files, staged_added, staged_deleted = staged_summary(self.repo)
+        if staged_files:
+            pinned.append(('staged', staged_files, f"+{staged_added}/-{staged_deleted}"))
+
+        self._stashes = list_stashes(self.repo)
+        if self._stashes:
+            pinned.append(('stashes', len(self._stashes), None))
+
+        self.table.setRowCount(len(pinned) + len(branches))
+
+        for r, (kind, count, detail) in enumerate(pinned):
+            self.pinned_rows[r] = kind
+            label = f"Staged Changes ({detail})" if kind == 'staged' else f"Stashes ({count})"
+            self.table.setItem(r, BR_COL_BRANCH, QTableWidgetItem(label))
+            self.table.setItem(r, BR_COL_DATE, QTableWidgetItem("-"))
+            self.table.setItem(r, BR_COL_CHANGED, QTableWidgetItem(str(count)))
+            for col in (BR_COL_FORK, BR_COL_DEL_LOCAL, BR_COL_DEL_REMOTE):
+                placeholder = QPushButton("-")
+                placeholder.setEnabled(False)
+                self.table.setCellWidget(r, col, placeholder)
+
+        offset = len(pinned)
+        for i, branch in enumerate(branches):
+            r = offset + i
             date_str = branch_last_commit_date(self.repo, branch)
             changed = branch_files_changed(self.repo, branch)
             since_fork = files_changed_since_fork(self.repo, branch, base) if branch != current else 0
@@ -440,7 +543,20 @@ class BranchPickerDialog(QDialog):
     def _on_cell_clicked(self, r, c):
         if c in (BR_COL_FORK, BR_COL_DEL_LOCAL, BR_COL_DEL_REMOTE):
             return
+        kind = self.pinned_rows.get(r)
+        if kind == 'staged':
+            self.stagedSelected.emit()
+            return
+        if kind == 'stashes':
+            self._open_stash_picker()
+            return
         self.branchSelected.emit(self.table.item(r, BR_COL_BRANCH).text())
+
+    def _open_stash_picker(self):
+        staged_files, _, _ = staged_summary(self.repo)
+        dlg = StashPickerDialog(self.repo, self._stashes, bool(staged_files), self)
+        dlg.stashDiffRequested.connect(self.stashDiffRequested.emit)
+        dlg.exec()
 
     def _confirm(self, title, branch, args):
         cmd = format_git_cmd(self.repo, args)
@@ -478,6 +594,54 @@ class BranchPickerDialog(QDialog):
         self.branchesChanged.emit()
 
 
+STASH_TABLE_HEADERS = ["Stash", "Message", "Date", "vs HEAD", "vs Staged"]
+ST_COL_REF, ST_COL_MSG, ST_COL_DATE, ST_COL_HEAD, ST_COL_STAGED = range(5)
+
+
+class StashPickerDialog(QDialog):
+    stashDiffRequested = pyqtSignal(str, str)
+
+    def __init__(self, repo, stashes, has_staged, parent=None):
+        super().__init__(parent)
+        self.repo = repo
+        self.setWindowTitle("Select Stash to Compare")
+        self.setWindowIcon(app_icon())
+        self.resize(720, 320)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Compare a stash against HEAD, or against your currently staged changes:"))
+
+        self.table = QTableWidget(len(stashes), len(STASH_TABLE_HEADERS))
+        self.table.setHorizontalHeaderLabels(STASH_TABLE_HEADERS)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+
+        for r, (ref, message, date_str) in enumerate(stashes):
+            self.table.setItem(r, ST_COL_REF, QTableWidgetItem(ref))
+            self.table.setItem(r, ST_COL_MSG, QTableWidgetItem(message))
+            self.table.setItem(r, ST_COL_DATE, QTableWidgetItem(date_str))
+
+            head_btn = QPushButton("vs HEAD")
+            head_btn.setToolTip(f"git diff HEAD {ref}")
+            head_btn.clicked.connect(lambda _checked, rf=ref: self._pick(rf, 'head'))
+            self.table.setCellWidget(r, ST_COL_HEAD, head_btn)
+
+            staged_btn = QPushButton("vs Staged")
+            staged_btn.setEnabled(has_staged)
+            staged_btn.setToolTip(f"git diff --staged {ref}" if has_staged else "Nothing is currently staged")
+            staged_btn.clicked.connect(lambda _checked, rf=ref: self._pick(rf, 'staged'))
+            self.table.setCellWidget(r, ST_COL_STAGED, staged_btn)
+
+        layout.addWidget(self.table)
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setSectionResizeMode(ST_COL_MSG, QHeaderView.ResizeMode.Stretch)
+
+    def _pick(self, ref, mode):
+        self.stashDiffRequested.emit(ref, mode)
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, repo, branch):
         super().__init__()
@@ -485,8 +649,10 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(ORG, APP)
         self.rows = []
         self._row_color_kinds = []
+        self.compare_mode = MODE_BRANCH
         self.compare_base = None
         self.compare_target = None
+        self.compare_ref = None
         self.dark_mode = self.settings.value("dark_mode", False, type=bool)
         self.row_colors = DARK_ROW_COLORS if self.dark_mode else LIGHT_ROW_COLORS
         self._tmpdir = tempfile.TemporaryDirectory(prefix="git-compare-ui-")
@@ -570,6 +736,8 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.cellDoubleClicked.connect(self._on_double_click)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_row_context_menu)
         layout.addWidget(self.table)
 
         self.status_bar = QStatusBar()
@@ -578,10 +746,14 @@ class MainWindow(QMainWindow):
         self.apply_theme()
 
         self.branch_picker = None
-        self._load_branches(branch)
-        if branch:
+        if branch.strip().lower() == 'staged':
+            self._load_branches(None)
+            self.show_staged_diff()
+        elif branch:
+            self._load_branches(branch)
             self.refresh()
         else:
+            self._load_branches(None)
             self.branch_combo.setCurrentText("")
             self.status_bar.showMessage("Select a branch to compare against…")
             self._show_branch_picker()
@@ -631,6 +803,8 @@ class MainWindow(QMainWindow):
         self.branch_picker.branchSelected.connect(self.apply_branch)
         self.branch_picker.branchesChanged.connect(self._on_branches_changed)
         self.branch_picker.forkDiffRequested.connect(self.show_fork_diff)
+        self.branch_picker.stagedSelected.connect(self.show_staged_diff)
+        self.branch_picker.stashDiffRequested.connect(self.show_stash_diff)
 
         # Being parentless (see above) means the window manager doesn't know to
         # stack this above the main window, and it can otherwise land exactly on
@@ -651,8 +825,10 @@ class MainWindow(QMainWindow):
         self._load_branches(current_text)
 
     def apply_branch(self, branch):
+        self.compare_mode = MODE_BRANCH
         self.compare_base = None
         self.compare_target = None
+        self.compare_ref = None
         idx = self.branch_combo.findText(branch)
         if idx >= 0:
             self.branch_combo.setCurrentIndex(idx)
@@ -671,8 +847,10 @@ class MainWindow(QMainWindow):
                                  f"Could not determine where '{branch}' forked from '{base_branch}'.")
             return
 
+        self.compare_mode = MODE_REFS
         self.compare_base = fp
         self.compare_target = branch
+        self.compare_ref = None
         idx = self.branch_combo.findText(branch)
         if idx >= 0:
             self.branch_combo.setCurrentIndex(idx)
@@ -683,6 +861,40 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"Comparing '{branch}' against its fork point {fp[:8]} from '{base_branch}' — "
             f"{len(self.rows)} file(s) changed since fork")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def show_staged_diff(self):
+        self.compare_mode = MODE_STAGED
+        self.compare_base = None
+        self.compare_target = None
+        self.compare_ref = 'HEAD'
+        self.branch_combo.setCurrentText("Staged (vs HEAD)")
+
+        self.refresh()
+        self.status_bar.showMessage(f"Comparing staged changes against HEAD — {len(self.rows)} file(s) changed")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def show_stash_diff(self, stash_ref, mode):
+        if mode == 'head':
+            self.compare_mode = MODE_REFS
+            self.compare_base = 'HEAD'
+            self.compare_target = stash_ref
+            self.compare_ref = None
+            desc = f"{stash_ref} vs HEAD"
+        else:
+            self.compare_mode = MODE_STAGED
+            self.compare_base = None
+            self.compare_target = None
+            self.compare_ref = stash_ref
+            desc = f"Staged vs {stash_ref}"
+        self.branch_combo.setCurrentText(desc)
+
+        self.refresh()
+        self.status_bar.showMessage(f"Comparing {desc} — {len(self.rows)} file(s) changed")
         self.show()
         self.raise_()
         self.activateWindow()
@@ -710,20 +922,16 @@ class MainWindow(QMainWindow):
                 self._set_row_color(r, kind)
 
     def refresh(self):
-        if self.compare_base:
-            try:
-                self.rows = diff_rows_refs(self.repo, self.compare_base, self.compare_target)
-            except RuntimeError as e:
-                QMessageBox.warning(self, "git diff failed", str(e))
-                self.rows = []
-            self._populate_table()
-            return
-
-        branch = self.branch_combo.currentText().strip()
-        if not branch:
-            return
         try:
-            self.rows = diff_rows(self.repo, branch)
+            if self.compare_mode == MODE_REFS:
+                self.rows = diff_rows_refs(self.repo, self.compare_base, self.compare_target)
+            elif self.compare_mode == MODE_STAGED:
+                self.rows = diff_rows_staged(self.repo, self.compare_ref)
+            else:
+                branch = self.branch_combo.currentText().strip()
+                if not branch:
+                    return
+                self.rows = diff_rows(self.repo, branch)
         except RuntimeError as e:
             QMessageBox.warning(self, "git diff failed", str(e))
             self.rows = []
@@ -886,6 +1094,82 @@ class MainWindow(QMainWindow):
     def _on_double_click(self, r, _col):
         self.run_row(r)
 
+    def _diff_args_for_row(self, row):
+        """git diff argument list (no leading 'diff') that reproduces the
+        comparison currently shown for `row`, matching whichever compare_mode
+        produced the table."""
+        if row.old_path and row.old_path != row.path:
+            path_args = ['--', row.old_path, row.path]
+        else:
+            path_args = ['--', row.path]
+
+        if self.compare_mode == MODE_REFS:
+            ref_args = [self.compare_base, self.compare_target]
+        elif self.compare_mode == MODE_STAGED:
+            ref_args = ['--staged', self.compare_ref]
+        else:
+            ref_args = [self.branch_combo.currentText().strip()]
+
+        return ['--find-renames'] + ref_args + path_args
+
+    def _copy_to_clipboard(self, text):
+        QApplication.clipboard().setText(text)
+        shown = text if len(text) <= 80 else text[:77] + "..."
+        self.status_bar.showMessage(f"Copied to clipboard: {shown}", 4000)
+
+    def _copy_diff_patch(self, diff_args):
+        try:
+            patch = run_git(self.repo, ['diff'] + diff_args)
+        except RuntimeError as e:
+            QMessageBox.warning(self, "git diff failed", str(e))
+            return
+        QApplication.clipboard().setText(patch)
+        self.status_bar.showMessage(
+            f"Copied diff patch to clipboard ({len(patch.splitlines())} line(s))", 4000)
+
+    def _show_row_context_menu(self, pos):
+        r = self.table.rowAt(pos.y())
+        if r < 0 or r >= len(self.rows):
+            return
+        row = self.rows[r]
+
+        menu = QMenu(self)
+
+        act = menu.addAction("Copy File Path")
+        act.triggered.connect(lambda: self._copy_to_clipboard(row.path))
+
+        act = menu.addAction("Copy Absolute File Path")
+        act.triggered.connect(lambda: self._copy_to_clipboard(str(self.repo / row.path)))
+
+        if row.old_path and row.old_path != row.path:
+            act = menu.addAction("Copy Old Path (pre-rename)")
+            act.triggered.connect(lambda: self._copy_to_clipboard(row.old_path))
+
+        menu.addSeparator()
+
+        diff_args = self._diff_args_for_row(row)
+
+        act = menu.addAction("Copy git diff Command")
+        act.triggered.connect(
+            lambda: self._copy_to_clipboard(format_git_cmd_shell(self.repo, ['diff'] + diff_args)))
+
+        act = menu.addAction("Copy git diff Output (patch)")
+        act.triggered.connect(lambda: self._copy_diff_patch(diff_args))
+
+        difftool_cmd_setting = self.settings.value("difftool_cmd", DEFAULT_DIFFTOOL_CMD)
+        act = menu.addAction("Copy git difftool Command")
+        act.triggered.connect(lambda: self._copy_to_clipboard(format_git_cmd_shell(
+            self.repo, ['difftool', '-y', '-x', difftool_cmd_setting] + diff_args)))
+
+        menu.addSeparator()
+
+        summary = (f"{row.path}\t{STATUS_NAMES.get(row.status, row.status)}\t"
+                   f"+{row.added}/-{row.deleted}" + (f"\t{row.reason}" if not row.comparable else ""))
+        act = menu.addAction("Copy Row Summary")
+        act.triggered.connect(lambda: self._copy_to_clipboard(summary))
+
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
     def run_checked(self):
         for r, row in enumerate(self.rows):
             if row.comparable and self._row_checked(r):
@@ -902,9 +1186,10 @@ class MainWindow(QMainWindow):
         difftool_cmd = self.settings.value("difftool_cmd", DEFAULT_DIFFTOOL_CMD)
 
         try:
-            if self.compare_base:
-                # Fork-point mode: both sides are fixed commits, neither is the
-                # working tree, so both must be extracted via `git show`.
+            if self.compare_mode == MODE_REFS:
+                # Both sides are fixed commits (fork-point diff, or HEAD vs a
+                # stash), neither is the working tree, so both must be
+                # extracted via `git show`.
                 base_ref, target_ref = self.compare_base, self.compare_target
                 if mode == "difftool":
                     ok = QProcess.startDetached(
@@ -913,6 +1198,19 @@ class MainWindow(QMainWindow):
                 else:
                     left_tmp = extract_branch_file(self.repo, base_ref, row.old_path or row.path, self.cache_dir)
                     right_tmp = extract_branch_file(self.repo, target_ref, row.path, self.cache_dir)
+                    ok = QProcess.startDetached(studio_path, ['diff', str(left_tmp), str(right_tmp)])
+            elif self.compare_mode == MODE_STAGED:
+                # Right side is the index (staged content), which may differ
+                # from both the working-tree file and `compare_ref` — extract
+                # it explicitly rather than using the on-disk path.
+                ref = self.compare_ref
+                if mode == "difftool":
+                    ok = QProcess.startDetached(
+                        'git', ['-C', str(self.repo), 'difftool', '-y', '-x', difftool_cmd,
+                                '--staged', ref, '--', row.path])
+                else:
+                    left_tmp = extract_branch_file(self.repo, ref, row.old_path or row.path, self.cache_dir)
+                    right_tmp = extract_index_file(self.repo, row.path, self.cache_dir)
                     ok = QProcess.startDetached(studio_path, ['diff', str(left_tmp), str(right_tmp)])
             else:
                 branch = self.branch_combo.currentText().strip()
@@ -942,7 +1240,8 @@ class MainWindow(QMainWindow):
 
 def main():
     parser = argparse.ArgumentParser(description="GUI table for reviewing and launching per-file git diffs")
-    parser.add_argument('branch', nargs='?', default='', help='compare-to branch (e.g. main)')
+    parser.add_argument('branch', nargs='?', default='',
+                         help='compare-to branch (e.g. main), or "staged" to open directly to staged changes')
     parser.add_argument('--repo', default='.', help='path to the git repo (default: current directory)')
     args = parser.parse_args()
 
