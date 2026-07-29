@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 """make_icons.py - regenerate icon.icns and icon.ico from icon.png.
 
 Run whenever icon.png changes, then commit all three files together.
