@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSettings, QProcess, QSize, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPalette, QAction
 
-from version import __version__
+VERSION = "v6.07.20"
 
 ORG = "LanDenLabs"
 APP = "git-compare-ui"
@@ -53,9 +53,9 @@ def app_icon():
 
 
 def _build_date():
-    """Release/build date, derived from version.py's mtime -- set-version.bash
-    rewrites version.py on every release, so this tracks the last publish."""
-    target = Path(__file__).resolve().parent / "version.py"
+    """Release/build date, derived from this file's mtime -- set-version.bash
+    rewrites the VERSION line on every release, so this tracks the last publish."""
+    target = Path(__file__).resolve()
     try:
         return datetime.fromtimestamp(target.stat().st_mtime).strftime("%Y-%m-%d")
     except OSError:
@@ -658,7 +658,7 @@ class MainWindow(QMainWindow):
         self._tmpdir = tempfile.TemporaryDirectory(prefix="git-compare-ui-")
         self.cache_dir = Path(self._tmpdir.name)
 
-        self.setWindowTitle(f"git-compare-ui v{__version__} — {self.repo.name}")
+        self.setWindowTitle(f"git-compare-ui {VERSION} — {self.repo.name}")
         self.setWindowIcon(app_icon())
         self.resize(1000, 600)
 
@@ -1248,7 +1248,7 @@ def main():
     app = QApplication(sys.argv)
     QApplication.setOrganizationName(ORG)
     QApplication.setApplicationName(APP)
-    QApplication.setApplicationVersion(__version__)
+    QApplication.setApplicationVersion(VERSION)
     app.setWindowIcon(app_icon())
 
     global _DEFAULT_STYLE_NAME, _DEFAULT_PALETTE
