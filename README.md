@@ -58,6 +58,10 @@ can't be diffed — their checkbox is disabled and the row is greyed out.
 - **Filter** (toolbar dropdown) narrows the table to specific file extensions
   — check any of `.java` / `.xml` / `.png` / `.gradle`, "Add extension…" for
   anything else, or "All" to clear the filter.
+- Click the **Status** column header to pick **Modified** (default) or **All**.
+  "All" also lists added and deleted files. Double-clicking an added file opens
+  it in Android Studio (or the system default app if Studio isn't found);
+  deleted rows can't be viewed and do nothing.
 - The theme button (half-light/half-dark icon) switches the whole app between
   light and dark, persisted between runs.
 

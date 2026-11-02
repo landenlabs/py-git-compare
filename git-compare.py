@@ -27,8 +27,8 @@ from PyQt6.QtWidgets import (
     QDialog, QFormLayout, QDialogButtonBox, QRadioButton, QMessageBox,
     QStatusBar, QToolButton, QMenu, QInputDialog, QStyle,
 )
-from PyQt6.QtCore import Qt, QSettings, QProcess, QSize, pyqtSignal
-from PyQt6.QtGui import QColor, QIcon, QPalette, QAction
+from PyQt6.QtCore import Qt, QSettings, QProcess, QSize, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QPalette, QAction, QDesktopServices
 
 VERSION = "v6.07.20"
 
@@ -71,6 +71,12 @@ STATUS_NAMES = {
 
 COL_CHECK, COL_FILE, COL_STATUS, COL_ADD, COL_DEL, COL_RESULT = range(6)
 HEADERS = ["", "File", "Status", "+", "-", "Result"]
+
+# Status filter (the "Status" column header doubles as a filter button):
+#   STATUS_MODIFIED - only files present on both sides (current/default behavior)
+#   STATUS_ALL      - also include Added and Deleted files
+STATUS_MODIFIED, STATUS_ALL = 'modified', 'all'
+STATUS_FILTER_LABELS = {STATUS_MODIFIED: "Modified", STATUS_ALL: "All"}
 
 # Comparison modes:
 #   MODE_BRANCH  - working tree vs a branch (branch_combo's current text)
@@ -736,6 +742,11 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.cellDoubleClicked.connect(self._on_double_click)
+        self.status_filter = STATUS_MODIFIED
+        header = self.table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._on_header_clicked)
+        self._update_status_header()
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_row_context_menu)
         layout.addWidget(self.table)
@@ -746,14 +757,17 @@ class MainWindow(QMainWindow):
         self.apply_theme()
 
         self.branch_picker = None
-        if branch.strip().lower() == 'staged':
-            self._load_branches(None)
+        self.repo_ok = True
+        self._load_branches(None)
+        if not self.repo_ok:
+            pass
+        elif branch.strip().lower() == 'staged':
             self.show_staged_diff()
         elif branch:
+            self.branch_combo.clear()
             self._load_branches(branch)
             self.refresh()
         else:
-            self._load_branches(None)
             self.branch_combo.setCurrentText("")
             self.status_bar.showMessage("Select a branch to compare against…")
             self._show_branch_picker()
@@ -769,7 +783,12 @@ class MainWindow(QMainWindow):
         try:
             branches = list_branches(self.repo)
         except RuntimeError as e:
-            QMessageBox.warning(self, "git branch failed", str(e))
+            if self.repo_ok:
+                self.repo_ok = False
+                # Show only the first line; full git output can be huge.
+                first = str(e).strip().splitlines()[0] if str(e).strip() else "git branch failed"
+                QMessageBox.warning(self, "git branch failed", first)
+            self.status_bar.showMessage("Not a git repository")
             branches = []
         self.branch_combo.addItems(branches)
         if preselect:
@@ -785,6 +804,7 @@ class MainWindow(QMainWindow):
             self.repo = self._resolve_repo(path)
             self.repo_edit.setText(str(self.repo))
             self.branch_combo.clear()
+            self.repo_ok = True
             self._load_branches(None)
             self.refresh()
 
@@ -922,6 +942,8 @@ class MainWindow(QMainWindow):
                 self._set_row_color(r, kind)
 
     def refresh(self):
+        if not self.repo_ok:
+            return
         try:
             if self.compare_mode == MODE_REFS:
                 self.rows = diff_rows_refs(self.repo, self.compare_base, self.compare_target)
@@ -984,6 +1006,35 @@ class MainWindow(QMainWindow):
         self.toggle_filter_btn.setIconSize(QSize(16, 16))
         self.toggle_filter_btn.setToolTip(tooltip)
 
+    def _update_status_header(self):
+        label = "Status ▾" if self.status_filter == STATUS_MODIFIED else "Status: All ▾"
+        item = QTableWidgetItem(label)
+        item.setToolTip("Click to filter by status (Modified / All)")
+        self.table.setHorizontalHeaderItem(COL_STATUS, item)
+
+    def _on_header_clicked(self, col):
+        if col != COL_STATUS:
+            return
+        menu = QMenu(self)
+        for key, text in STATUS_FILTER_LABELS.items():
+            act = menu.addAction(text if key == STATUS_MODIFIED else "All (include added / deleted)")
+            act.setCheckable(True)
+            act.setChecked(self.status_filter == key)
+            act.triggered.connect(lambda _checked, k=key: self._set_status_filter(k))
+        header = self.table.horizontalHeader()
+        pos = header.mapToGlobal(header.rect().bottomLeft())
+        pos.setX(pos.x() + header.sectionViewportPosition(COL_STATUS))
+        menu.exec(pos)
+
+    def _set_status_filter(self, mode):
+        self.status_filter = mode
+        self._update_status_header()
+        self._apply_row_filter()
+        self.table.resizeColumnToContents(COL_STATUS)
+
+    def _status_visible(self, row):
+        return self.status_filter == STATUS_ALL or row.status not in ('A', 'D')
+
     def _extension_visible(self, path):
         if not self.active_extensions:
             return True
@@ -991,9 +1042,12 @@ class MainWindow(QMainWindow):
 
     def _apply_row_filter(self):
         for r in range(self.table.rowCount()):
-            hide_by_state = (not self.show_all) and (not self._row_checked(r))
-            hide_by_ext = not self._extension_visible(self.rows[r].path)
-            self.table.setRowHidden(r, hide_by_state or hide_by_ext)
+            row = self.rows[r]
+            # Added/deleted rows are never checked, so they bypass the
+            # "checked rows only" collapse once the status filter includes them.
+            hide_by_state = (not self.show_all) and (not self._row_checked(r)) and row.comparable
+            hide_by_ext = not self._extension_visible(row.path)
+            self.table.setRowHidden(r, hide_by_state or hide_by_ext or not self._status_visible(row))
 
     def _on_checkbox_toggled(self, r, checked):
         if not self.show_all:
@@ -1177,6 +1231,11 @@ class MainWindow(QMainWindow):
 
     def run_row(self, r):
         row = self.rows[r]
+        if row.status == 'D':
+            return  # nothing to view: the file no longer exists on the new side
+        if row.status == 'A':
+            self._open_added_file(r, row)
+            return
         if not row.comparable:
             self.status_bar.showMessage(f"Cannot compare: {row.path} — {row.reason}")
             return
@@ -1228,6 +1287,38 @@ class MainWindow(QMainWindow):
                 self._set_row_color(r, 'ran')
             else:
                 self.table.setItem(r, COL_RESULT, QTableWidgetItem("Failed to launch"))
+                self._set_row_color(r, 'error')
+        except RuntimeError as e:
+            self.table.setItem(r, COL_RESULT, QTableWidgetItem(f"Error: {e}"))
+            self._set_row_color(r, 'error')
+
+    def _added_file_path(self, row):
+        """Local path holding the added file's content, extracting it from git
+        when the new side is a ref/index rather than the working tree."""
+        if self.compare_mode == MODE_REFS:
+            return extract_branch_file(self.repo, self.compare_target, row.path, self.cache_dir)
+        if self.compare_mode == MODE_STAGED:
+            return extract_index_file(self.repo, row.path, self.cache_dir)
+        return self.repo / row.path
+
+    def _open_added_file(self, r, row):
+        """View an added file — in Android Studio when available, otherwise
+        the system default application."""
+        try:
+            path = self._added_file_path(row)
+            if not path.exists():
+                raise RuntimeError("file not found on disk")
+            studio_path = self.settings.value("studio_path", DEFAULT_STUDIO)
+            if Path(studio_path).exists():
+                ok = QProcess.startDetached(studio_path, [str(path)])
+            else:
+                ok = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            if ok:
+                self.table.setItem(r, COL_RESULT,
+                                    QTableWidgetItem(f"Opened {datetime.now().strftime('%H:%M:%S')}"))
+                self._set_row_color(r, 'ran')
+            else:
+                self.table.setItem(r, COL_RESULT, QTableWidgetItem("Failed to open"))
                 self._set_row_color(r, 'error')
         except RuntimeError as e:
             self.table.setItem(r, COL_RESULT, QTableWidgetItem(f"Error: {e}"))
